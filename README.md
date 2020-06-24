@@ -11,4 +11,4 @@
 
 ## A snap shot of Tensorboard results
 
-![](/images/TensorBoard.png)
+![](/images/TensorBoard2.png)
