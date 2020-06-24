@@ -1,93 +1,82 @@
 import torch
+import numpy as np
 from transformers import BertConfig, BertModel, BertForMaskedLM, BertTokenizer
-
+from config import replace, preEnc, preEncDec
 from easydict import EasyDict as ED
+from pytorch_lightning.core.lightning import LightningModule
+from torch.utils.data import Dataset, DataLoader
+from data import IndicDataset, PadSequence
 
-class TranslationModel(torch.nn.Module):
 
-    def __init__(self, encoder, decoder):
+def init_seed():
+    seed_val = 42
+    np.random.seed(seed_val)
+    torch.manual_seed(seed_val)
+    torch.cuda.manual_seed_all(seed_val)
 
-        super().__init__() 
 
-        #Creating encoder and decoder with their respective embeddings.
+class TranslationModel(LightningModule):
+
+    def __init__(self, encoder, decoder, tokenizers, pad_sequence):
+
+        super().__init__()
+        # Creating encoder and decoder with their respective embeddings.
         self.encoder = encoder
         self.decoder = decoder
+        self.tokenizers = tokenizers
+        self.pad_sequence = pad_sequence
+        self.config = preEncDec
 
     def forward(self, encoder_input_ids, decoder_input_ids):
 
         encoder_hidden_states = self.encoder(encoder_input_ids)[0]
         loss, logits = self.decoder(decoder_input_ids,
-                                    encoder_hidden_states=encoder_hidden_states, 
+                                    encoder_hidden_states=encoder_hidden_states,
                                     masked_lm_labels=decoder_input_ids)
 
         return loss, logits
 
-    def save(self, tokenizers, output_dirs):
-        from train_util import save_model
+    def prepare_data(self):
+        self.indic_train = IndicDataset(
+            self.tokenizers.src, self.tokenizers.tgt, self.config.data, True)
+        self.indic_test = IndicDataset(
+            self.tokenizers.src, self.tokenizers.tgt, self.config.data, False)
 
-        save_model(self.encoder, output_dirs.encoder)
-        save_model(self.decoder, output_dirs.decoder)
+    def train_dataloader(self):
+        train_loader = DataLoader(self.indic_train,
+                                  batch_size=self.config.batch_size,
+                                  shuffle=False,
+                                  num_workers=4,
+                                  collate_fn=self.pad_sequence)
+        self.len_train_loader = len(train_loader)
+        return train_loader
 
-def build_model(config):
-    
-    src_tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
-    tgt_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    def val_dataloader(self):
+        eval_loader = DataLoader(self.indic_test,
+                                 batch_size=self.config.eval_size,
+                                 shuffle=False,
+                                 num_workers=4,
+                                 collate_fn=self.pad_sequence)
+        self.len_eval_loader = len(eval_loader)
+        return eval_loader
 
-    tgt_tokenizer.bos_token = '<s>'
-    tgt_tokenizer.eos_token = '</s>'
-    
-    #hidden_size and intermediate_size are both wrt all the attention heads. 
-    #Should be divisible by num_attention_heads
-    encoder_config = BertConfig(vocab_size=src_tokenizer.vocab_size,
-                                hidden_size=config.hidden_size,
-                                num_hidden_layers=config.num_hidden_layers,
-                                num_attention_heads=config.num_attention_heads,
-                                intermediate_size=config.intermediate_size,
-                                hidden_act=config.hidden_act,
-                                hidden_dropout_prob=config.dropout_prob,
-                                attention_probs_dropout_prob=config.dropout_prob,
-                                max_position_embeddings=512,
-                                type_vocab_size=2,
-                                initializer_range=0.02,
-                                layer_norm_eps=1e-12)
+    def configure_optimizers(self):
+        init_seed()
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.config.lr)
+        return optimizer
 
-    decoder_config = BertConfig(vocab_size=tgt_tokenizer.vocab_size,
-                                hidden_size=config.hidden_size,
-                                num_hidden_layers=config.num_hidden_layers,
-                                num_attention_heads=config.num_attention_heads,
-                                intermediate_size=config.intermediate_size,
-                                hidden_act=config.hidden_act,
-                                hidden_dropout_prob=config.dropout_prob,
-                                attention_probs_dropout_prob=config.dropout_prob,
-                                max_position_embeddings=512,
-                                type_vocab_size=2,
-                                initializer_range=0.02,
-                                layer_norm_eps=1e-12,
-                                is_decoder=True)
+    def training_step(self, batch, batch_idx):
+        data, target = batch
+        loss, logits = self(data, target)
+        logs = {'loss': loss}
+        return {'loss': loss, 'log': logs}
 
-    #Create encoder and decoder embedding layers.
-    encoder_embeddings = torch.nn.Embedding(src_tokenizer.vocab_size, config.hidden_size, padding_idx=src_tokenizer.pad_token_id)
-    decoder_embeddings = torch.nn.Embedding(tgt_tokenizer.vocab_size, config.hidden_size, padding_idx=tgt_tokenizer.pad_token_id)
+    def validation_step(self, batch, batch_idx):
+        data, target = batch
+        loss, logits = self(data, target)
+        return {'val_loss': loss}
 
-    encoder = BertModel(encoder_config)
-    encoder.set_input_embeddings(encoder_embeddings.cuda())
-    
-    decoder = BertForMaskedLM(decoder_config)
-    decoder.set_input_embeddings(decoder_embeddings.cuda())
-
-    model = TranslationModel(encoder, decoder)
-    model.cuda()
-
-
-    tokenizers = ED({'src': src_tokenizer, 'tgt': tgt_tokenizer})
-    return model, tokenizers
-
-
-
-
-
-
-
-
-
-
+    def validation_epoch_end(self, outputs):
+        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+        tensorboard_logs = {'val_loss': avg_loss}
+        return {'avg_val_loss': avg_loss, 'log': tensorboard_logs}
